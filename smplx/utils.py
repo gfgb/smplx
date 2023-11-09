@@ -29,6 +29,7 @@ class ModelOutput:
     joints: Optional[Tensor] = None
     full_pose: Optional[Tensor] = None
     global_orient: Optional[Tensor] = None
+    extra_global_orient: Optional[Tensor] = None
     transl: Optional[Tensor] = None
     v_shaped: Optional[Tensor] = None
 

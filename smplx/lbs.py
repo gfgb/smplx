@@ -28,12 +28,12 @@ from .utils import rot_mat_to_euler, Tensor
 
 
 def find_dynamic_lmk_idx_and_bcoords(
-    vertices: Tensor,
-    pose: Tensor,
-    dynamic_lmk_faces_idx: Tensor,
-    dynamic_lmk_b_coords: Tensor,
-    neck_kin_chain: List[int],
-    pose2rot: bool = True,
+        vertices: Tensor,
+        pose: Tensor,
+        dynamic_lmk_faces_idx: Tensor,
+        dynamic_lmk_b_coords: Tensor,
+        neck_kin_chain: List[int],
+        pose2rot: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     ''' Compute the faces, barycentric coordinates for the dynamic landmarks
 
@@ -84,7 +84,7 @@ def find_dynamic_lmk_idx_and_bcoords(
 
     rel_rot_mat = torch.eye(
         3, device=vertices.device, dtype=dtype).unsqueeze_(dim=0).repeat(
-            batch_size, 1, 1)
+        batch_size, 1, 1)
     for idx in range(len(neck_kin_chain)):
         rel_rot_mat = torch.bmm(rot_mats[:, idx], rel_rot_mat)
 
@@ -106,10 +106,10 @@ def find_dynamic_lmk_idx_and_bcoords(
 
 
 def vertices2landmarks(
-    vertices: Tensor,
-    faces: Tensor,
-    lmk_faces_idx: Tensor,
-    lmk_bary_coords: Tensor
+        vertices: Tensor,
+        faces: Tensor,
+        lmk_faces_idx: Tensor,
+        lmk_bary_coords: Tensor
 ) -> Tensor:
     ''' Calculates landmarks by barycentric interpolation
 
@@ -138,10 +138,10 @@ def vertices2landmarks(
 
     lmk_faces = torch.index_select(faces, 0, lmk_faces_idx.view(-1).to(torch.long)).view(
         batch_size, -1, 3)
-                        #The '.to(torch.long)'.
-                        # added to make the trace work in c++,
-                        # otherwise you get a runtime error in c++:
-                        # 'index_select(): Expected dtype int32 or int64 for index'
+    # The '.to(torch.long)'.
+    # added to make the trace work in c++,
+    # otherwise you get a runtime error in c++:
+    # 'index_select(): Expected dtype int32 or int64 for index'
 
     lmk_faces += torch.arange(
         batch_size, dtype=torch.long, device=device).view(-1, 1, 1) * num_verts
@@ -154,15 +154,16 @@ def vertices2landmarks(
 
 
 def lbs(
-    betas: Tensor,
-    pose: Tensor,
-    v_template: Tensor,
-    shapedirs: Tensor,
-    posedirs: Tensor,
-    J_regressor: Tensor,
-    parents: Tensor,
-    lbs_weights: Tensor,
-    pose2rot: bool = True,
+        betas: Tensor,
+        pose: Tensor,
+        v_template: Tensor,
+        shapedirs: Tensor,
+        posedirs: Tensor,
+        J_regressor: Tensor,
+        parents: Tensor,
+        lbs_weights: Tensor,
+        pose2rot: bool = True,
+        extra_root_joint_at_origin: bool = False
 ) -> Tuple[Tensor, Tensor]:
     ''' Performs Linear Blend Skinning with the given shape and pose parameters
 
@@ -191,6 +192,9 @@ def lbs(
             matrices. The default value is True. If False, then the pose tensor
             should already contain rotation matrices and have a size of
             Bx(J + 1)x9
+        extra_root_joint_at_origin: bool, optional
+            This is set to True if the body model instance is initialized with
+            an extra root joint.
         dtype: torch.dtype, optional
 
         Returns
@@ -212,6 +216,8 @@ def lbs(
     # NxJx3 array
     J = vertices2joints(J_regressor, v_shaped)
 
+    skip_joints_idx = 2 if extra_root_joint_at_origin else 1
+
     # 3. Add pose blend shapes
     # N x J x 3 x 3
     ident = torch.eye(3, dtype=dtype, device=device)
@@ -219,12 +225,13 @@ def lbs(
         rot_mats = batch_rodrigues(pose.view(-1, 3)).view(
             [batch_size, -1, 3, 3])
 
-        pose_feature = (rot_mats[:, 1:, :, :] - ident).view([batch_size, -1])
+
+        pose_feature = (rot_mats[:, skip_joints_idx:, :, :] - ident).view([batch_size, -1])
         # (N x P) x (P, V * 3) -> N x V x 3
         pose_offsets = torch.matmul(
             pose_feature, posedirs).view(batch_size, -1, 3)
     else:
-        pose_feature = pose[:, 1:].view(batch_size, -1, 3, 3) - ident
+        pose_feature = pose[:, skip_joints_idx:].view(batch_size, -1, 3, 3) - ident
         rot_mats = pose.view(batch_size, -1, 3, 3)
 
         pose_offsets = torch.matmul(pose_feature.view(batch_size, -1),
@@ -232,6 +239,7 @@ def lbs(
 
     v_posed = pose_offsets + v_shaped
     # 4. Get the global joint location
+
     J_transformed, A = batch_rigid_transform(rot_mats, J, parents, dtype=dtype)
 
     # 5. Do skinning:
@@ -297,8 +305,8 @@ def blend_shapes(betas: Tensor, shape_disps: Tensor) -> Tensor:
 
 
 def batch_rodrigues(
-    rot_vecs: Tensor,
-    epsilon: float = 1e-8,
+        rot_vecs: Tensor,
+        epsilon: float = 1e-8,
 ) -> Tensor:
     ''' Calculates the rotation matrices for a batch of rotation vectors
         Parameters
@@ -347,10 +355,10 @@ def transform_mat(R: Tensor, t: Tensor) -> Tensor:
 
 
 def batch_rigid_transform(
-    rot_mats: Tensor,
-    joints: Tensor,
-    parents: Tensor,
-    dtype=torch.float32
+        rot_mats: Tensor,
+        joints: Tensor,
+        parents: Tensor,
+        dtype=torch.float32
 ) -> Tensor:
     """
     Applies a batch of rigid transformations to the joints

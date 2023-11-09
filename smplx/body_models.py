@@ -46,32 +46,32 @@ TensorOutput = namedtuple('TensorOutput',
 
 
 class SMPL(nn.Module):
-
     NUM_JOINTS = 23
     NUM_BODY_JOINTS = 23
     SHAPE_SPACE_DIM = 300
 
     def __init__(
-        self, model_path: str,
-        kid_template_path: str = '',
-        data_struct: Optional[Struct] = None,
-        create_betas: bool = True,
-        betas: Optional[Tensor] = None,
-        num_betas: int = 10,
-        create_global_orient: bool = True,
-        global_orient: Optional[Tensor] = None,
-        create_body_pose: bool = True,
-        body_pose: Optional[Tensor] = None,
-        create_transl: bool = True,
-        transl: Optional[Tensor] = None,
-        dtype=torch.float32,
-        batch_size: int = 1,
-        joint_mapper=None,
-        gender: str = 'neutral',
-        age: str = 'adult',
-        vertex_ids: Dict[str, int] = None,
-        v_template: Optional[Union[Tensor, Array]] = None,
-        **kwargs
+            self, model_path: str,
+            kid_template_path: str = '',
+            data_struct: Optional[Struct] = None,
+            create_betas: bool = True,
+            betas: Optional[Tensor] = None,
+            num_betas: int = 10,
+            create_global_orient: bool = True,
+            global_orient: Optional[Tensor] = None,
+            create_body_pose: bool = True,
+            body_pose: Optional[Tensor] = None,
+            create_transl: bool = True,
+            transl: Optional[Tensor] = None,
+            dtype=torch.float32,
+            batch_size: int = 1,
+            joint_mapper=None,
+            gender: str = 'neutral',
+            age: str = 'adult',
+            vertex_ids: Dict[str, int] = None,
+            v_template: Optional[Union[Tensor, Array]] = None,
+            extra_root_joint_at_origin: bool = False,
+            **kwargs
     ) -> None:
         ''' SMPL model constructor
 
@@ -124,6 +124,11 @@ class SMPL(nn.Module):
             vertex_ids: dict, optional
                 A dictionary containing the indices of the extra vertices that
                 will be selected
+            extra_root_joint_at_origin: bool, optional
+                Flag for creating an extra root joint placed at (0, 0, 0). This allows to easily rotate the body
+                without the need to keep into account the default root joint offset. If this is set to True, the
+                forward method must be given the `extra_global_orient` argument.
+                (default = False)
         '''
 
         self.gender = gender
@@ -268,6 +273,14 @@ class SMPL(nn.Module):
         lbs_weights = to_tensor(to_np(data_struct.weights), dtype=dtype)
         self.register_buffer('lbs_weights', lbs_weights)
 
+        # the joint regressor, linear blend skinning weights and the joints hierarchy
+        # are modified to take into account a new parent joint
+        self.extra_root_joint_at_origin = extra_root_joint_at_origin
+        if self.extra_root_joint_at_origin:
+            self.J_regressor = nn.functional.pad(self.J_regressor, (0, 0, 1, 0))
+            self.lbs_weights = nn.functional.pad(self.lbs_weights, (1, 0))
+            self.parents = torch.cat([torch.tensor([-1]), self.parents + 1])
+
     @property
     def num_betas(self):
         return self._num_betas
@@ -305,23 +318,24 @@ class SMPL(nn.Module):
         return '\n'.join(msg)
 
     def forward_shape(
-        self,
-        betas: Optional[Tensor] = None,
+            self,
+            betas: Optional[Tensor] = None,
     ) -> SMPLOutput:
         betas = betas if betas is not None else self.betas
         v_shaped = self.v_template + blend_shapes(betas, self.shapedirs)
         return SMPLOutput(vertices=v_shaped, betas=betas, v_shaped=v_shaped)
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        body_pose: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        return_verts=True,
-        return_full_pose: bool = False,
-        pose2rot: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            body_pose: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            return_verts=True,
+            return_full_pose: bool = False,
+            pose2rot: bool = True,
+            **kwargs
     ) -> SMPLOutput:
         ''' Forward pass for the SMPL model
 
@@ -331,6 +345,12 @@ class SMPL(nn.Module):
                 If given, ignore the member variable and use it as the global
                 rotation of the body. Useful if someone wishes to predicts this
                 with an external model. (default=None)
+            extra_global_orient: torch.tensor, optional, shape Bx3
+                If given, use it as the global rotation of the body having the origin as center of rotation. Useful to
+                allow rotating the body without having to take into account the offset of the default root joint.
+                This argument must not be None if the flag `extra_root_joint_at_origin` is set to True when 
+                initializing the model. 
+                (default=None)
             betas: torch.tensor, optional, shape BxN_b
                 If given, ignore the member variable `betas` and use it
                 instead. For example, it can used if shape parameters
@@ -375,10 +395,16 @@ class SMPL(nn.Module):
             num_repeats = int(batch_size / betas.shape[0])
             betas = betas.expand(num_repeats, -1)
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=pose2rot)
+                               self.lbs_weights, pose2rot=pose2rot,
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         joints = self.vertex_joint_selector(vertices, joints)
         # Map the joints to the current dataset
@@ -391,6 +417,7 @@ class SMPL(nn.Module):
 
         output = SMPLOutput(vertices=vertices if return_verts else None,
                             global_orient=global_orient,
+                            extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                             body_pose=body_pose,
                             joints=joints,
                             betas=betas,
@@ -401,9 +428,9 @@ class SMPL(nn.Module):
 
 class SMPLLayer(SMPL):
     def __init__(
-        self,
-        *args,
-        **kwargs
+            self,
+            *args,
+            **kwargs
     ) -> None:
         # Just create a SMPL module without any member variables
         super(SMPLLayer, self).__init__(
@@ -416,15 +443,16 @@ class SMPLLayer(SMPL):
         )
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        body_pose: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        return_verts=True,
-        return_full_pose: bool = False,
-        pose2rot: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            body_pose: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            return_verts=True,
+            return_full_pose: bool = False,
+            pose2rot: bool = True,
+            **kwargs
     ) -> SMPLOutput:
         ''' Forward pass for the SMPL model
 
@@ -434,6 +462,12 @@ class SMPLLayer(SMPL):
                 Global rotation of the body.  Useful if someone wishes to
                 predicts this with an external model. It is expected to be in
                 rotation matrix format.  (default=None)
+            extra_global_orient: torch.tensor, optional, shape Bx3
+                If given, use it as the global rotation of the body having the origin as center of rotation. Useful to
+                allow rotating the body without having to take into account the offset of the default root joint.
+                This argument must not be None if the flag `extra_root_joint_at_origin` is set to True when 
+                initializing the model. 
+                (default=None)
             betas: torch.tensor, optional, shape BxN_b
                 Shape parameters. For example, it can used if shape parameters
                 `betas` are predicted from some external model.
@@ -469,7 +503,7 @@ class SMPLLayer(SMPL):
         if body_pose is None:
             body_pose = torch.eye(3, device=device, dtype=dtype).view(
                 1, 1, 3, 3).expand(
-                    batch_size, self.NUM_BODY_JOINTS, -1, -1).contiguous()
+                batch_size, self.NUM_BODY_JOINTS, -1, -1).contiguous()
         if betas is None:
             betas = torch.zeros([batch_size, self.num_betas],
                                 dtype=dtype, device=device)
@@ -480,11 +514,17 @@ class SMPLLayer(SMPL):
              body_pose.reshape(-1, self.NUM_BODY_JOINTS, 3, 3)],
             dim=1)
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights,
-                               pose2rot=False)
+                               pose2rot=False,
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         joints = self.vertex_joint_selector(vertices, joints)
         # Map the joints to the current dataset
@@ -497,6 +537,7 @@ class SMPLLayer(SMPL):
 
         output = SMPLOutput(vertices=vertices if return_verts else None,
                             global_orient=global_orient,
+                            extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                             body_pose=body_pose,
                             joints=joints,
                             betas=betas,
@@ -506,32 +547,31 @@ class SMPLLayer(SMPL):
 
 
 class SMPLH(SMPL):
-
     # The hand joints are replaced by MANO
     NUM_BODY_JOINTS = SMPL.NUM_JOINTS - 2
     NUM_HAND_JOINTS = 15
     NUM_JOINTS = NUM_BODY_JOINTS + 2 * NUM_HAND_JOINTS
 
     def __init__(
-        self, model_path,
-        kid_template_path: str = '',
-        data_struct: Optional[Struct] = None,
-        create_left_hand_pose: bool = True,
-        left_hand_pose: Optional[Tensor] = None,
-        create_right_hand_pose: bool = True,
-        right_hand_pose: Optional[Tensor] = None,
-        use_pca: bool = True,
-        num_pca_comps: int = 6,
-        num_betas=16,
-        flat_hand_mean: bool = False,
-        batch_size: int = 1,
-        gender: str = 'neutral',
-        age: str = 'adult',
-        dtype=torch.float32,
-        vertex_ids=None,
-        use_compressed: bool = True,
-        ext: str = 'pkl',
-        **kwargs
+            self, model_path,
+            kid_template_path: str = '',
+            data_struct: Optional[Struct] = None,
+            create_left_hand_pose: bool = True,
+            left_hand_pose: Optional[Tensor] = None,
+            create_right_hand_pose: bool = True,
+            right_hand_pose: Optional[Tensor] = None,
+            use_pca: bool = True,
+            num_pca_comps: int = 6,
+            num_betas=16,
+            flat_hand_mean: bool = False,
+            batch_size: int = 1,
+            gender: str = 'neutral',
+            age: str = 'adult',
+            dtype=torch.float32,
+            vertex_ids=None,
+            use_compressed: bool = True,
+            ext: str = 'pkl',
+            **kwargs
     ) -> None:
         ''' SMPLH model constructor
 
@@ -694,17 +734,18 @@ class SMPLH(SMPL):
         return '\n'.join(msg)
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        body_pose: Optional[Tensor] = None,
-        left_hand_pose: Optional[Tensor] = None,
-        right_hand_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = False,
-        pose2rot: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            body_pose: Optional[Tensor] = None,
+            left_hand_pose: Optional[Tensor] = None,
+            right_hand_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = False,
+            pose2rot: bool = True,
+            **kwargs
     ) -> SMPLHOutput:
         '''
         '''
@@ -736,10 +777,16 @@ class SMPLH(SMPL):
                                right_hand_pose], dim=1)
         full_pose += self.pose_mean
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=pose2rot)
+                               self.lbs_weights, pose2rot=pose2rot,
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         # Add any extra joints that might be needed
         joints = self.vertex_joint_selector(vertices, joints)
@@ -754,6 +801,7 @@ class SMPLH(SMPL):
                              joints=joints,
                              betas=betas,
                              global_orient=global_orient,
+                             extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                              body_pose=body_pose,
                              left_hand_pose=left_hand_pose,
                              right_hand_pose=right_hand_pose,
@@ -765,7 +813,7 @@ class SMPLH(SMPL):
 class SMPLHLayer(SMPLH):
 
     def __init__(
-        self, *args, **kwargs
+            self, *args, **kwargs
     ) -> None:
         ''' SMPL+H as a layer model constructor
         '''
@@ -780,17 +828,18 @@ class SMPLHLayer(SMPLH):
             **kwargs)
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        body_pose: Optional[Tensor] = None,
-        left_hand_pose: Optional[Tensor] = None,
-        right_hand_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = False,
-        pose2rot: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            body_pose: Optional[Tensor] = None,
+            left_hand_pose: Optional[Tensor] = None,
+            right_hand_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = False,
+            pose2rot: bool = True,
+            **kwargs
     ) -> SMPLHOutput:
         ''' Forward pass for the SMPL+H model
 
@@ -800,6 +849,10 @@ class SMPLHLayer(SMPLH):
                 Global rotation of the body. Useful if someone wishes to
                 predicts this with an external model. It is expected to be in
                 rotation matrix format. (default=None)
+            extra_global_orient: torch.tensor, optional, shape Bx3
+                If given, use it as the global rotation of the body having the origin as center of rotation. Useful to
+                allow rotating the body without having to take into account the offset of the default root joint.
+                (default=None)
             betas: torch.tensor, optional, shape BxN_b
                 Shape parameters. For example, it can used if shape parameters
                 `betas` are predicted from some external model.
@@ -865,10 +918,16 @@ class SMPLHLayer(SMPLH):
              right_hand_pose.reshape(-1, self.NUM_HAND_JOINTS, 3, 3)],
             dim=1)
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=False)
+                               self.lbs_weights, pose2rot=False,
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         # Add any extra joints that might be needed
         joints = self.vertex_joint_selector(vertices, joints)
@@ -883,6 +942,7 @@ class SMPLHLayer(SMPLH):
                              joints=joints,
                              betas=betas,
                              global_orient=global_orient,
+                             extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                              body_pose=body_pose,
                              left_hand_pose=left_hand_pose,
                              right_hand_pose=right_hand_pose,
@@ -908,24 +968,24 @@ class SMPLX(SMPLH):
     NECK_IDX = 12
 
     def __init__(
-        self, model_path: str,
-        kid_template_path: str = '',
-        num_expression_coeffs: int = 10,
-        create_expression: bool = True,
-        expression: Optional[Tensor] = None,
-        create_jaw_pose: bool = True,
-        jaw_pose: Optional[Tensor] = None,
-        create_leye_pose: bool = True,
-        leye_pose: Optional[Tensor] = None,
-        create_reye_pose=True,
-        reye_pose: Optional[Tensor] = None,
-        use_face_contour: bool = False,
-        batch_size: int = 1,
-        gender: str = 'neutral',
-        age: str = 'adult',
-        dtype=torch.float32,
-        ext: str = 'npz',
-        **kwargs
+            self, model_path: str,
+            kid_template_path: str = '',
+            num_expression_coeffs: int = 10,
+            create_expression: bool = True,
+            expression: Optional[Tensor] = None,
+            create_jaw_pose: bool = True,
+            jaw_pose: Optional[Tensor] = None,
+            create_leye_pose: bool = True,
+            leye_pose: Optional[Tensor] = None,
+            create_reye_pose=True,
+            reye_pose: Optional[Tensor] = None,
+            use_face_contour: bool = False,
+            batch_size: int = 1,
+            gender: str = 'neutral',
+            age: str = 'adult',
+            dtype=torch.float32,
+            ext: str = 'npz',
+            **kwargs
     ) -> None:
         ''' SMPLX model constructor
 
@@ -1120,22 +1180,23 @@ class SMPLX(SMPLH):
         return '\n'.join(msg)
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        body_pose: Optional[Tensor] = None,
-        left_hand_pose: Optional[Tensor] = None,
-        right_hand_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        expression: Optional[Tensor] = None,
-        jaw_pose: Optional[Tensor] = None,
-        leye_pose: Optional[Tensor] = None,
-        reye_pose: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = False,
-        pose2rot: bool = True,
-        return_shaped: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            body_pose: Optional[Tensor] = None,
+            left_hand_pose: Optional[Tensor] = None,
+            right_hand_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            expression: Optional[Tensor] = None,
+            jaw_pose: Optional[Tensor] = None,
+            leye_pose: Optional[Tensor] = None,
+            reye_pose: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = False,
+            pose2rot: bool = True,
+            return_shaped: bool = True,
+            **kwargs
     ) -> SMPLXOutput:
         '''
         Forward pass for the SMPLX model
@@ -1146,6 +1207,10 @@ class SMPLX(SMPLH):
                 If given, ignore the member variable and use it as the global
                 rotation of the body. Useful if someone wishes to predicts this
                 with an external model. (default=None)
+            extra_global_orient: torch.tensor, optional, shape Bx3
+                If given, use it as the global rotation of the body having the origin as center of rotation. Useful to
+                allow rotating the body without having to take into account the offset of the default root joint.
+                (default=None)
             betas: torch.tensor, optional, shape BxN_b
                 If given, ignore the member variable `betas` and use it
                 instead. For example, it can used if shape parameters
@@ -1240,11 +1305,16 @@ class SMPLX(SMPLH):
 
         shapedirs = torch.cat([self.shapedirs, self.expr_dirs], dim=-1)
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(shape_components, full_pose, self.v_template,
                                shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=pose2rot,
-                               )
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
             dim=0).expand(batch_size, -1).contiguous()
@@ -1288,25 +1358,26 @@ class SMPLX(SMPLH):
         else:
             v_shaped = Tensor(0)
         output = SMPLXOutput(vertices=vertices if return_verts else None,
-                              joints=joints,
-                              betas=betas,
-                              expression=expression,
-                              global_orient=global_orient,
-                              transl=transl,
-                              body_pose=body_pose,
-                              left_hand_pose=left_hand_pose,
-                              right_hand_pose=right_hand_pose,
-                              jaw_pose=jaw_pose,
-                              v_shaped=v_shaped,
-                              full_pose=full_pose if return_full_pose else None)
+                             joints=joints,
+                             betas=betas,
+                             expression=expression,
+                             global_orient=global_orient,
+                             extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
+                             transl=transl,
+                             body_pose=body_pose,
+                             left_hand_pose=left_hand_pose,
+                             right_hand_pose=right_hand_pose,
+                             jaw_pose=jaw_pose,
+                             v_shaped=v_shaped,
+                             full_pose=full_pose if return_full_pose else None)
         return output
 
 
 class SMPLXLayer(SMPLX):
     def __init__(
-        self,
-        *args,
-        **kwargs
+            self,
+            *args,
+            **kwargs
     ) -> None:
         # Just create a SMPLX module without any member variables
         super(SMPLXLayer, self).__init__(
@@ -1324,20 +1395,21 @@ class SMPLXLayer(SMPLX):
         )
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        body_pose: Optional[Tensor] = None,
-        left_hand_pose: Optional[Tensor] = None,
-        right_hand_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        expression: Optional[Tensor] = None,
-        jaw_pose: Optional[Tensor] = None,
-        leye_pose: Optional[Tensor] = None,
-        reye_pose: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            body_pose: Optional[Tensor] = None,
+            left_hand_pose: Optional[Tensor] = None,
+            right_hand_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            expression: Optional[Tensor] = None,
+            jaw_pose: Optional[Tensor] = None,
+            leye_pose: Optional[Tensor] = None,
+            reye_pose: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = True,
+            **kwargs
     ) -> TensorOutput:
         '''
         Forward pass for the SMPLX model
@@ -1349,6 +1421,10 @@ class SMPLXLayer(SMPLX):
                 rotation of the body. Useful if someone wishes to predicts this
                 with an external model. It is expected to be in rotation matrix
                 format. (default=None)
+            extra_global_orient: torch.tensor, optional, shape Bx3
+                If given, use it as the global rotation of the body having the origin as center of rotation. Useful to
+                allow rotating the body without having to take into account the offset of the default root joint.
+                (default=None)
             betas: torch.tensor, optional, shape BxN_b
                 If given, ignore the member variable `betas` and use it
                 instead. For example, it can used if shape parameters
@@ -1405,7 +1481,7 @@ class SMPLXLayer(SMPLX):
         if body_pose is None:
             body_pose = torch.eye(3, device=device, dtype=dtype).view(
                 1, 1, 3, 3).expand(
-                    batch_size, self.NUM_BODY_JOINTS, -1, -1).contiguous()
+                batch_size, self.NUM_BODY_JOINTS, -1, -1).contiguous()
         if left_hand_pose is None:
             left_hand_pose = torch.eye(3, device=device, dtype=dtype).view(
                 1, 1, 3, 3).expand(batch_size, 15, -1, -1).contiguous()
@@ -1444,12 +1520,17 @@ class SMPLXLayer(SMPLX):
 
         shapedirs = torch.cat([self.shapedirs, self.expr_dirs], dim=-1)
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(shape_components, full_pose, self.v_template,
                                shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights,
                                pose2rot=False,
-                               )
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
             dim=0).expand(batch_size, -1).contiguous()
@@ -1492,6 +1573,7 @@ class SMPLXLayer(SMPLX):
                               betas=betas,
                               expression=expression,
                               global_orient=global_orient,
+                              extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                               body_pose=body_pose,
                               left_hand_pose=left_hand_pose,
                               right_hand_pose=right_hand_pose,
@@ -1509,21 +1591,21 @@ class MANO(SMPL):
     NUM_JOINTS = NUM_BODY_JOINTS + NUM_HAND_JOINTS
 
     def __init__(
-        self,
-        model_path: str,
-        is_rhand: bool = True,
-        data_struct: Optional[Struct] = None,
-        create_hand_pose: bool = True,
-        hand_pose: Optional[Tensor] = None,
-        use_pca: bool = True,
-        num_pca_comps: int = 6,
-        flat_hand_mean: bool = False,
-        batch_size: int = 1,
-        dtype=torch.float32,
-        vertex_ids=None,
-        use_compressed: bool = True,
-        ext: str = 'pkl',
-        **kwargs
+            self,
+            model_path: str,
+            is_rhand: bool = True,
+            data_struct: Optional[Struct] = None,
+            create_hand_pose: bool = True,
+            hand_pose: Optional[Tensor] = None,
+            use_pca: bool = True,
+            num_pca_comps: int = 6,
+            flat_hand_mean: bool = False,
+            batch_size: int = 1,
+            dtype=torch.float32,
+            vertex_ids=None,
+            use_compressed: bool = True,
+            ext: str = 'pkl',
+            **kwargs
     ) -> None:
         ''' MANO model constructor
 
@@ -1656,14 +1738,15 @@ class MANO(SMPL):
         return '\n'.join(msg)
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        hand_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = False,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            hand_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = False,
+            **kwargs
     ) -> MANOOutput:
         ''' Forward pass for the MANO model
         '''
@@ -1687,11 +1770,16 @@ class MANO(SMPL):
         full_pose = torch.cat([global_orient, hand_pose], dim=1)
         full_pose += self.pose_mean
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=True,
-                               )
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         # # Add pre-selected extra joints that might be needed
         # joints = self.vertex_joint_selector(vertices, joints)
@@ -1707,6 +1795,7 @@ class MANO(SMPL):
                             joints=joints if return_verts else None,
                             betas=betas,
                             global_orient=global_orient,
+                            extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                             hand_pose=hand_pose,
                             full_pose=full_pose if return_full_pose else None)
 
@@ -1728,14 +1817,15 @@ class MANOLayer(MANO):
         return 'MANO'
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        hand_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = False,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            hand_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = False,
+            **kwargs
     ) -> MANOOutput:
         ''' Forward pass for the MANO model
         '''
@@ -1756,10 +1846,17 @@ class MANOLayer(MANO):
             transl = torch.zeros([batch_size, 3], dtype=dtype, device=device)
 
         full_pose = torch.cat([global_orient, hand_pose], dim=1)
+
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=False)
+                               self.lbs_weights, pose2rot=False,
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         if self.joint_mapper is not None:
             joints = self.joint_mapper(joints)
@@ -1773,6 +1870,7 @@ class MANOLayer(MANO):
             joints=joints if return_verts else None,
             betas=betas,
             global_orient=global_orient,
+            extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
             hand_pose=hand_pose,
             full_pose=full_pose if return_full_pose else None)
 
@@ -1786,26 +1884,26 @@ class FLAME(SMPL):
     NECK_IDX = 0
 
     def __init__(
-        self,
-        model_path: str,
-        data_struct=None,
-        num_expression_coeffs=10,
-        create_expression: bool = True,
-        expression: Optional[Tensor] = None,
-        create_neck_pose: bool = True,
-        neck_pose: Optional[Tensor] = None,
-        create_jaw_pose: bool = True,
-        jaw_pose: Optional[Tensor] = None,
-        create_leye_pose: bool = True,
-        leye_pose: Optional[Tensor] = None,
-        create_reye_pose=True,
-        reye_pose: Optional[Tensor] = None,
-        use_face_contour=False,
-        batch_size: int = 1,
-        gender: str = 'neutral',
-        dtype: torch.dtype = torch.float32,
-        ext='pkl',
-        **kwargs
+            self,
+            model_path: str,
+            data_struct=None,
+            num_expression_coeffs=10,
+            create_expression: bool = True,
+            expression: Optional[Tensor] = None,
+            create_neck_pose: bool = True,
+            neck_pose: Optional[Tensor] = None,
+            create_jaw_pose: bool = True,
+            jaw_pose: Optional[Tensor] = None,
+            create_leye_pose: bool = True,
+            leye_pose: Optional[Tensor] = None,
+            create_reye_pose=True,
+            reye_pose: Optional[Tensor] = None,
+            use_face_contour=False,
+            batch_size: int = 1,
+            gender: str = 'neutral',
+            dtype: torch.dtype = torch.float32,
+            ext='pkl',
+            **kwargs
     ) -> None:
         ''' FLAME model constructor
 
@@ -2006,19 +2104,20 @@ class FLAME(SMPL):
         return '\n'.join(msg)
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        neck_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        expression: Optional[Tensor] = None,
-        jaw_pose: Optional[Tensor] = None,
-        leye_pose: Optional[Tensor] = None,
-        reye_pose: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = False,
-        pose2rot: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            neck_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            expression: Optional[Tensor] = None,
+            jaw_pose: Optional[Tensor] = None,
+            leye_pose: Optional[Tensor] = None,
+            reye_pose: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = False,
+            pose2rot: bool = True,
+            **kwargs
     ) -> FLAMEOutput:
         '''
         Forward pass for the SMPLX model
@@ -2029,6 +2128,10 @@ class FLAME(SMPL):
                 If given, ignore the member variable and use it as the global
                 rotation of the body. Useful if someone wishes to predicts this
                 with an external model. (default=None)
+            extra_global_orient: torch.tensor, optional, shape Bx3
+                If given, use it as the global rotation of the body having the origin as center of rotation. Useful to
+                allow rotating the body without having to take into account the offset of the default root joint.
+                (default=None)
             betas: torch.tensor, optional, shape Bx10
                 If given, ignore the member variable `betas` and use it
                 instead. For example, it can used if shape parameters
@@ -2093,11 +2196,16 @@ class FLAME(SMPL):
         shape_components = torch.cat([betas, expression], dim=-1)
         shapedirs = torch.cat([self.shapedirs, self.expr_dirs], dim=-1)
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(shape_components, full_pose, self.v_template,
                                shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=pose2rot,
-                               )
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
             dim=0).expand(batch_size, -1).contiguous()
@@ -2139,6 +2247,7 @@ class FLAME(SMPL):
                              betas=betas,
                              expression=expression,
                              global_orient=global_orient,
+                             extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                              neck_pose=neck_pose,
                              jaw_pose=jaw_pose,
                              full_pose=full_pose if return_full_pose else None)
@@ -2160,19 +2269,20 @@ class FLAMELayer(FLAME):
             **kwargs)
 
     def forward(
-        self,
-        betas: Optional[Tensor] = None,
-        global_orient: Optional[Tensor] = None,
-        neck_pose: Optional[Tensor] = None,
-        transl: Optional[Tensor] = None,
-        expression: Optional[Tensor] = None,
-        jaw_pose: Optional[Tensor] = None,
-        leye_pose: Optional[Tensor] = None,
-        reye_pose: Optional[Tensor] = None,
-        return_verts: bool = True,
-        return_full_pose: bool = False,
-        pose2rot: bool = True,
-        **kwargs
+            self,
+            betas: Optional[Tensor] = None,
+            global_orient: Optional[Tensor] = None,
+            extra_global_orient: Optional[Tensor] = None,
+            neck_pose: Optional[Tensor] = None,
+            transl: Optional[Tensor] = None,
+            expression: Optional[Tensor] = None,
+            jaw_pose: Optional[Tensor] = None,
+            leye_pose: Optional[Tensor] = None,
+            reye_pose: Optional[Tensor] = None,
+            return_verts: bool = True,
+            return_full_pose: bool = False,
+            pose2rot: bool = True,
+            **kwargs
     ) -> FLAMEOutput:
         '''
         Forward pass for the SMPLX model
@@ -2183,6 +2293,10 @@ class FLAMELayer(FLAME):
                 Global rotation of the body. Useful if someone wishes to
                 predicts this with an external model. It is expected to be in
                 rotation matrix format. (default=None)
+            extra_global_orient: torch.tensor, optional, shape Bx3
+                If given, use it as the global rotation of the body having the origin as center of rotation. Useful to
+                allow rotating the body without having to take into account the offset of the default root joint.
+                (default=None)
             betas: torch.tensor, optional, shape BxN_b
                 Shape parameters. For example, it can used if shape parameters
                 `betas` are predicted from some external model.
@@ -2243,11 +2357,16 @@ class FLAMELayer(FLAME):
         shape_components = torch.cat([betas, expression], dim=-1)
         shapedirs = torch.cat([self.shapedirs, self.expr_dirs], dim=-1)
 
+        if self.extra_root_joint_at_origin:
+            extra_global_orient = torch.zeros_like(
+                global_orient) if extra_global_orient is None else extra_global_orient
+            full_pose = torch.cat([extra_global_orient, full_pose], dim=1)
+
         vertices, joints = lbs(shape_components, full_pose, self.v_template,
                                shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=False,
-                               )
+                               extra_root_joint_at_origin=self.extra_root_joint_at_origin)
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
             dim=0).expand(batch_size, -1).contiguous()
@@ -2288,6 +2407,7 @@ class FLAMELayer(FLAME):
                              betas=betas,
                              expression=expression,
                              global_orient=global_orient,
+                             extra_global_orient=extra_global_orient if self.extra_root_joint_at_origin else None,
                              neck_pose=neck_pose,
                              jaw_pose=jaw_pose,
                              full_pose=full_pose if return_full_pose else None)
@@ -2295,9 +2415,9 @@ class FLAMELayer(FLAME):
 
 
 def build_layer(
-    model_path: str,
-    model_type: str = 'smpl',
-    **kwargs
+        model_path: str,
+        model_type: str = 'smpl',
+        **kwargs
 ) -> Union[SMPLLayer, SMPLHLayer, SMPLXLayer, MANOLayer, FLAMELayer]:
     ''' Method for creating a model from a path and a model type
 
@@ -2363,9 +2483,9 @@ def build_layer(
 
 
 def create(
-    model_path: str,
-    model_type: str = 'smpl',
-    **kwargs
+        model_path: str,
+        model_type: str = 'smpl',
+        **kwargs
 ) -> Union[SMPL, SMPLH, SMPLX, MANO, FLAME]:
     ''' Method for creating a model from a path and a model type
 
